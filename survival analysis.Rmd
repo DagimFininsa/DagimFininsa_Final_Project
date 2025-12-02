@@ -1,0 +1,521 @@
+---
+title: "CRC survival"
+author: "Dagim Fininsa"
+date: "2025-11-05"
+output: html_document
+---
+
+```{r}
+# 1.Install packages and libraries
+pacman:: p_load(survival, ggfortify, survminer, readxl, ggplot2, tidyverse, gtsummary, dplyr)
+```
+
+# 2. Read in SEER data on Colorectal cancer treatment
+```{r, chunk2, warning=FALSE}
+seer_raw <- read_csv("CRC_SEER_TImetoTreatment.csv")#read the data
+```
+```{r}
+#recoding names
+seer <- seer_raw %>%
+  rename(
+    year_dx           = `Year of diagnosis`,
+    income_median_23  = `Median household income inflation adj to 2023`,
+    rural_code        = `Rural-Urban Continuum Code`,
+    age_group         = `Age recode with <1 year olds and 90+`,
+    sex               = Sex,
+    race_recode       = `Race recode (W, B, AI, API)`,
+    hispanic_origin   = `Origin recode NHIA (Hispanic, Non-Hisp)`,
+    site_recode       = `Site recode ICD-O-3/WHO 2008`,
+    stage_sum2000     = `Summary stage 2000 (1998-2017)`,
+    grade_recode      = `Grade Recode (thru 2017)`,
+    ttt_raw           = `Time from diagnosis to treatment in days recode`,
+    surg_prim         = `RX Summ--Surg Prim Site (1998+)`,
+    vital_status      = `Vital status recode (study cutoff used)`,
+    surv_months_raw   = `Survival months`,
+    cod_site          = `COD to site recode`
+    # if you still have Surg/Rad Seq we can rename later
+  )
+```
+
+```{r}
+ # 2) Recreate numeric and categorical time-to-treatment
+seer <- seer %>%
+  mutate(
+    # numeric time to treatment in days
+    ttt_num = case_when(
+      ttt_raw == "Unable to calculate" ~ NA_real_,  # treat as missing
+      ttt_raw == "731+ days"           ~ 731,       # cap at 731
+      TRUE                             ~ as.numeric(ttt_raw)  # includes "000"
+    ),
+    
+    # time-to-treatment categories for analysis
+    ttt_cat = case_when(
+      is.na(ttt_num)        ~ NA_character_,
+      ttt_num <= 30         ~ "0-30 days",
+      ttt_num <= 59         ~ "31-59 days",
+      ttt_num <= 89         ~ "60-89 days",
+      TRUE                  ~ "90+ days"
+    ),
+    
+    ttt_cat = factor(
+      ttt_cat,
+      levels = c("0-30 days", "31-59 days", "60-89 days", "90+ days")
+    )
+  )
+
+# quick check
+table(seer$ttt_cat, useNA = "ifany")
+```
+#here we can see that each catagory has enough samples for this analysis and we also see the missing amount
+
+
+```{r}
+# Convert survival time from character to numeric (months)
+seer <- seer %>%
+  mutate(
+    surv_months = as.numeric(surv_months_raw)
+  )
+
+# Check distribution of survival time
+summary(seer$surv_months)
+```
+# Survival time ranges from 0 to 83 months, with a median of 62 months (IQR 22 to 72)
+
+```{r}
+# Summarize cause of death categories
+seer %>%
+  count(cod_site) %>%
+  arrange(desc(n))
+
+# Create indicator for CRC-specific death:
+# 1 = death due to colon or rectal cancer, 0 = alive or died of another cause
+seer <- seer %>%
+  mutate(
+    event_crc = case_when(
+      cod_site %in% c("Colon excluding Rectum",
+                      "Rectum and Rectosigmoid Junction") ~ 1L,
+      TRUE ~ 0L
+    )
+  )
+
+# Table shows the number of CRC-specific deaths (1) versus all other outcomes (0)
+table(seer$event_crc)
+```
+# There are 14,344 CRC-specific deaths and 34,562 patients who were alive or died of other causes
+```{r}
+# Examine distribution of SEER Summary Stage (Localized, Regional, Distant)
+seer %>%
+  count(stage_sum2000) %>%
+  arrange(desc(n))
+
+# Examine distribution of tumor grade categories (including Unknown)
+seer %>%
+  count(grade_recode) %>%
+  arrange(desc(n))
+
+# Examine distribution of race categories used in SEER
+seer %>%
+  count(race_recode) %>%
+  arrange(desc(n))
+```
+
+
+```{r}
+seer <- seer %>%
+  mutate(
+    #Recode SEER Summary Stage as an ordered factor (Localized = reference)
+    stage3 = factor(
+      stage_sum2000,
+      levels = c("Localized", "Regional", "Distant")
+    ),
+
+    # Collapse detailed grade into 4 categories and keep Unknown as its own group
+    grade4 = case_when(
+      grade_recode == "Well differentiated; Grade I"                    ~ "Grade I",
+      grade_recode == "Moderately differentiated; Grade II"             ~ "Grade II",
+      grade_recode %in% c("Poorly differentiated; Grade III",
+                          "Undifferentiated; anaplastic; Grade IV")     ~ "Grade III/IV",
+      grade_recode == "Unknown"                                         ~ "Unknown",
+      TRUE                                                              ~ NA_character_
+    ),
+    grade4 = factor(
+      grade4,
+      levels = c("Grade I", "Grade II", "Grade III/IV", "Unknown")
+    )
+  )
+
+# Check counts for the 3-level stage variable
+table(seer$stage3, useNA = "ifany")
+
+# Check counts for the 4-level grade variable (including Unknown)
+table(seer$grade4, useNA = "ifany")
+```
+# Stage distribution: 16,862 localized, 20,697 regional, and 11,347 distant cases
+
+# Grade distribution: 4,311 Grade I, 31,945 Grade II, 6,969 Grade III/IV, 5,681 unknown grade
+
+```{r}
+seer <- seer %>%
+  mutate(
+    # Create 5-level race variable and keep Unknown as its own category
+    race5 = factor(
+      race_recode,
+      levels = c("White",
+                 "Black",
+                 "Asian or Pacific Islander",
+                 "American Indian/Alaska Native",
+                 "Unknown")
+    ),
+    
+    # Create 3-level race variable (White, Black, Other) for modeling
+    race3 = case_when(
+      race_recode == "White" ~ "White",
+      race_recode == "Black" ~ "Black",
+      TRUE                   ~ "Other"
+    ),
+    race3 = factor(race3, levels = c("White", "Black", "Other"))
+  )
+
+# Check distribution of the 5-level race variable
+table(seer$race5, useNA = "ifany")
+
+# Check distribution of the 3-level race variable used in models
+table(seer$race3, useNA = "ifany")
+
+```
+
+
+
+```{r}
+# Examine distribution of rural-urban continuum codes
+seer %>%
+  count(rural_code) %>%
+  arrange(rural_code)
+
+# Examine distribution of age categories at diagnosis
+seer %>%
+  count(age_group) %>%
+  arrange(age_group)
+
+# Examine sex distribution
+seer %>%
+  count(sex)
+
+# Examine Hispanic origin distribution
+seer %>%
+  count(hispanic_origin)
+```
+
+
+
+```{r}
+seer <- seer %>%
+  mutate(
+    # Recode rural-urban continuum into 3 categories:
+    # Metro, Non-metro, and Unknown (other or missing text)
+    rural3 = case_when(
+      grepl("^Counties in metropolitan", rural_code) ~ "Metro",
+      grepl("^Nonmetropolitan", rural_code)         ~ "Non-metro",
+      TRUE                                          ~ "Unknown"
+    ),
+    rural3 = factor(rural3, levels = c("Metro", "Non-metro", "Unknown")),
+    
+    # Treat age at diagnosis groups as an ordered factor
+    age_group = factor(age_group, levels = unique(age_group)),
+    
+    # Code sex as a factor with Male as the reference level
+    sex = factor(sex, levels = c("Male", "Female")),
+    
+    # Create binary Hispanic ethnicity indicator from SEER origin variable
+    hisp = if_else(hispanic_origin == "Spanish-Hispanic-Latino",
+                   "Hispanic", "Non-Hispanic"),
+    hisp = factor(hisp, levels = c("Non-Hispanic", "Hispanic"))
+  )
+
+# Check counts for rurality categories (Metro, Non-metro, Unknown)
+table(seer$rural3, useNA = "ifany")
+
+# Check sex distribution with Male as reference category
+table(seer$sex, useNA = "ifany")
+
+# Check distribution of Hispanic vs Non-Hispanic
+table(seer$hisp, useNA = "ifany")
+```
+
+
+
+
+```{r}
+seer <- seer %>%
+  mutate(
+    # Treat county-level median income category as a categorical SES variable
+    income_cat = factor(income_median_23)
+  )
+```
+
+
+```{r}
+# Create analytic dataset: require non-missing time-to-treatment and survival time
+seer_analytic <- seer %>%
+  filter(!is.na(ttt_num),
+         !is.na(surv_months))
+
+# Quick checks:
+nrow(seer_analytic)              # total N included in analytic cohort
+table(seer_analytic$ttt_cat)     # distribution of time-to-treatment categories
+table(seer_analytic$event_crc)   # number of CRC deaths (1) vs censored/other (0)
+table(seer_analytic$income_cat, useNA = "ifany")  # SES distribution (including Unknown)
+```
+
+
+```{r}
+# Descriptive table of patient and tumor characteristics by time-to-treatment category
+# Using gtsummary for formatted summary statistics
+# install.packages("gtsummary")  # run once if you don't have it
+
+table1 <- seer_analytic %>%
+  select(
+    ttt_cat,        # main exposure: time to treatment (0–30, 31–59, 60–89, 90+ days)
+    age_group,      # age at diagnosis (categorical)
+    sex,            # sex
+    race3,          # race (White, Black, Other)
+    hisp,           # Hispanic ethnicity
+    stage3,         # SEER summary stage (Localized, Regional, Distant)
+    grade4,         # tumor grade (I, II, III/IV, Unknown)
+    rural3,         # rural/urban category
+    income_cat      # county-level income category (SES)
+  ) %>%
+  tbl_summary(
+    by = ttt_cat,   # summarize characteristics across time-to-treatment groups
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1
+  ) %>%
+  add_overall(last = TRUE, col_label = "**Overall**")  # add overall column at the end
+
+table1  # renders Table 1: characteristics by time-to-treatment category
+```
+
+
+
+```{r}
+# Create survival object for CRC-specific mortality
+surv_obj <- Surv(time = seer_analytic$surv_months,
+                 event = seer_analytic$event_crc)
+
+# Fit Kaplan–Meier survival curves by time-to-treatment category
+fit_km_ttt <- survfit(surv_obj ~ ttt_cat, data = seer_analytic)
+
+# Summary survival at each event time for each TTT group
+summary(fit_km_ttt)
+```
+
+
+```{r}
+# Plot Kaplan–Meier curves by time-to-treatment category
+km_plot_ttt <- ggsurvplot(
+  fit_km_ttt,
+  data        = seer_analytic,
+  risk.table  = TRUE,   # show number at risk over time
+  pval        = TRUE,   # display log rank p value on the plot
+  conf.int    = FALSE,  # do not show confidence bands
+  legend.title = "Time to treatment",
+  legend.labs  = levels(seer_analytic$ttt_cat),
+  xlab        = "Months since diagnosis",
+  ylab        = "CRC specific survival probability"
+)
+
+km_plot_ttt   # print KM plot with risk table and p value
+
+# Global log rank test comparing survival curves across TTT groups
+# Output provides chi square statistic and p value for equality of curves
+survdiff(surv_obj ~ ttt_cat, data = seer_analytic)
+```
+# KM curves differ significantly by time-to-treatment (log rank χ² = 28.2, p ≈ 3e-06);
+# patients treated in 31–59 days have the best CRC-specific survival, those treated
+# within 0–30 days or ≥90 days have lower survival over follow up.
+
+```{r}
+# Unadjusted Cox model: time-to-treatment as sole predictor
+cox_tt_unadj <- coxph(
+  Surv(surv_months, event_crc) ~ ttt_cat,
+  data = seer_analytic
+)
+
+summary(cox_tt_unadj)
+```
+# Unadjusted Cox model: vs 0–30 days, 31–59 days has lower CRC mortality (HR 0.92, 95% CI 0.88–0.96),
+# 60–89 days is similar (HR 1.04, 95% CI 0.96–1.12), and ≥90 days has higher mortality
+# (HR 1.16, 95% CI 1.05–1.27); overall association between TTT and survival is significant (p ≈ 4e-06).
+
+
+```{r}
+# Fit adjusted Cox proportional hazards model for CRC-specific mortality
+# Main exposure: time-to-treatment category (ttt_cat; ref = 0–30 days)
+# Covariates: age at diagnosis, sex, race, Hispanic ethnicity, SEER stage,
+#             tumor grade, rural/urban status, and county-level income category
+cox_tt_adj <- coxph(
+  Surv(surv_months, event_crc) ~ 
+    ttt_cat +
+    age_group +
+    sex +
+    race3 +
+    hisp +
+    stage3 +
+    grade4 +
+    rural3 +
+    income_cat,
+  data = seer_analytic
+)
+
+# Display adjusted hazard ratios, 95% CIs, and model fit statistics
+summary(cox_tt_adj)
+```
+# In the adjusted model (ref = 0–30 days), treatment at 31–59 days (HR 0.83, 95% CI 0.79–0.86)
+# and 60–89 days (HR 0.88, 95% CI 0.82–0.95) is associated with lower CRC mortality, while ≥90 days
+# is similar to 0–30 days (HR 0.91, 95% CI 0.83–1.00). Older age, regional/distant stage,
+# higher or unknown grade, Black race and Hispanic ethnicity are associated with higher mortality;
+# female sex has lower mortality. Model discrimination is good (concordance ≈ 0.81).
+
+```{r}
+# Test proportional hazards assumption for the adjusted Cox model
+ph_test <- cox.zph(cox_tt_adj)
+
+# Print global and covariate-specific tests for PH assumption
+ph_test
+```
+# PH assumption is statistically violated for ttt_cat and several covariates,
+# and globally (p < 0.001); with this large sample, HRs are best interpreted
+# as average effects over follow-up rather than perfectly constant over time.
+
+
+```{r}
+# Create formatted regression table of adjusted Cox model (HRs and 95% CIs)
+cox_table <- tbl_regression(
+  cox_tt_adj,
+  exponentiate = TRUE   # report results as hazard ratios instead of log-coefficients
+) %>%
+  bold_labels()          # bold variable labels for readability
+
+cox_table   # display table of adjusted HRs suitable for inclusion in results
+```
+
+
+```{r}
+# Fit adjusted Cox model including interaction between time-to-treatment and race
+cox_tt_race_int <- coxph(
+  Surv(surv_months, event_crc) ~ 
+    ttt_cat * race3 +   # ttt_cat main effect + race3 main effect + their interaction
+    age_group +
+    sex +
+    hisp +
+    stage3 +
+    grade4 +
+    rural3 +
+    income_cat,
+  data = seer_analytic
+)
+
+# Likelihood ratio test comparing models with and without TTT × race interaction
+# Tests whether the association between time-to-treatment and CRC mortality differs by race
+anova(cox_tt_adj, cox_tt_race_int, test = "LRT")
+```
+# LRT comparing models with and without TTT × race interaction:
+# χ² = 4.80 on 6 df, p = 0.57, indicating no evidence that the
+# association between time-to-treatment and CRC mortality differs by race.
+
+```{r}
+# Fit adjusted Cox model including interaction between time-to-treatment and rurality
+cox_tt_rural_int <- coxph(
+  Surv(surv_months, event_crc) ~ 
+    ttt_cat * rural3 +    # ttt_cat main effect + rural3 main effect + their interaction
+    age_group +
+    sex +
+    race3 +
+    hisp +
+    stage3 +
+    grade4 +
+    income_cat,
+  data = seer_analytic
+)
+
+# Likelihood ratio test comparing models with and without TTT × rurality interaction
+anova(cox_tt_adj, cox_tt_rural_int, test = "LRT")
+```
+# LRT comparing models with and without TTT × rurality interaction:
+# χ² = 14.6 on 6 df, p = 0.024, indicating evidence that the association
+# between time-to-treatment and CRC mortality differs by rural3 category.
+
+```{r}
+# Stratified analysis by rurality (drop "Unknown" because N is small for EM)
+seer_metro <- seer_analytic %>%
+  filter(rural3 == "Metro")
+
+seer_nonmetro <- seer_analytic %>%
+  filter(rural3 == "Non-metro")
+
+# Adjusted Cox model among patients in metropolitan counties
+cox_metro <- coxph(
+  Surv(surv_months, event_crc) ~ 
+    ttt_cat +
+    age_group +
+    sex +
+    race3 +
+    hisp +
+    stage3 +
+    grade4 +
+    income_cat,
+  data = seer_metro
+)
+
+# Adjusted Cox model among patients in non-metropolitan counties
+cox_nonmetro <- coxph(
+  Surv(surv_months, event_crc) ~ 
+    ttt_cat +
+    age_group +
+    sex +
+    race3 +
+    hisp +
+    stage3 +
+    grade4 +
+    income_cat,
+  data = seer_nonmetro
+)
+
+# Extract time-to-treatment coefficients (HRs, SEs, p values) for Metro model
+summary(cox_metro)$coefficients[grep("^ttt_cat", rownames(summary(cox_metro)$coefficients)), ]
+
+# Extract time-to-treatment coefficients for Non-metro model
+summary(cox_nonmetro)$coefficients[grep("^ttt_cat", rownames(summary(cox_nonmetro)$coefficients)), ]
+```
+# In metro counties, compared with 0–30 days, all delay groups have lower CRC mortality:
+# 31–59 days HR ≈ 0.81 (p < 0.001), 60–89 days HR ≈ 0.91 (p ≈ 0.02),
+# and ≥90 days HR ≈ 0.90 (p ≈ 0.04).
+
+# In non metro counties, 31–59 days is similar to 0–30 days (HR ≈ 0.94, p ≈ 0.33),
+# 60–89 days shows lower CRC mortality (HR ≈ 0.73, p ≈ 0.01),
+# and ≥90 days is essentially the same as 0–30 days (HR ≈ 1.03, p ≈ 0.84).
+
+```{r}
+# Save KM plot to file
+ggsave("fig_km_ttt_crc.png",
+       km_plot_ttt$plot,
+       width = 7, height = 5, dpi = 300)
+
+# Save Table 1 and adjusted Cox model table as HTML
+as_gt(table1) %>%
+  gt::gtsave("table1_ttt_by_chars.html")
+
+as_gt(cox_table) %>%
+  gt::gtsave("table2_cox_ttt_adj.html")
+
+# Save cleaned analytic dataset for reproducibility
+# CSV version for inspection and use outside R
+write.csv(seer_analytic,
+          file = "seer_analytic_ttt_crc.csv",
+          row.names = FALSE)
+
+```
+
